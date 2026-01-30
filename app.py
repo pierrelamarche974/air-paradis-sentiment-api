@@ -1,33 +1,45 @@
 """
 API FastAPI pour l'analyse de sentiment - Air Paradis
-Modèle: USE (Universal Sentence Encoder) + LogisticRegression
+Modèle: LSTM Bidirectionnel + FastText (TensorFlow Lite)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import tensorflow_hub as hub
-import joblib
+import pickle
 import numpy as np
 import os
+import tensorflow as tf
 
 # Configuration
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "model", "use_logreg.pkl")
-USE_MODEL_URL = "https://tfhub.dev/google/universal-sentence-encoder/4"
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "model")
+MODEL_PATH = os.path.join(MODEL_DIR, "lstm_fasttext.tflite")
+TOKENIZER_PATH = os.path.join(MODEL_DIR, "tokenizer.pkl")
+CONFIG_PATH = os.path.join(MODEL_DIR, "config.pkl")
 
 # Initialisation de l'application
 app = FastAPI(
     title="Air Paradis - Sentiment Analysis API",
-    description="API de détection de bad buzz pour Air Paradis",
-    version="1.0.0"
+    description="API de détection de bad buzz pour Air Paradis (LSTM + FastText)",
+    version="2.0.0"
 )
 
-# Chargement des modèles au démarrage
-print("Chargement du modèle USE...")
-use_model = hub.load(USE_MODEL_URL)
-print("Modèle USE chargé.")
+# Chargement au démarrage
+print("Chargement de la configuration...")
+with open(CONFIG_PATH, "rb") as f:
+    config = pickle.load(f)
+MAX_LEN = config["max_len"]
+print(f"MAX_LEN: {MAX_LEN}")
 
-print("Chargement du classifieur LogReg...")
-clf = joblib.load(MODEL_PATH)
-print("Classifieur chargé.")
+print("Chargement du tokenizer...")
+with open(TOKENIZER_PATH, "rb") as f:
+    tokenizer = pickle.load(f)
+print("Tokenizer chargé.")
+
+print("Chargement du modèle TFLite...")
+interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+print("Modèle TFLite chargé.")
 
 
 # Schémas Pydantic
@@ -52,19 +64,41 @@ class PredictionOutput(BaseModel):
 
 class HealthOutput(BaseModel):
     status: str
+    model: str
+
+
+def preprocess_text(texts: list[str]) -> np.ndarray:
+    """Prétraite les textes pour le modèle LSTM."""
+    sequences = tokenizer.texts_to_sequences(texts)
+    # Padding manuel
+    padded = np.zeros((len(sequences), MAX_LEN), dtype=np.float32)
+    for i, seq in enumerate(sequences):
+        length = min(len(seq), MAX_LEN)
+        padded[i, :length] = seq[:length]
+    return padded
+
+
+def predict_single(text: str) -> tuple[int, float]:
+    """Prédit le sentiment d'un seul texte."""
+    X = preprocess_text([text])
+    interpreter.set_tensor(input_details[0]['index'], X)
+    interpreter.invoke()
+    proba = float(interpreter.get_tensor(output_details[0]['index'])[0][0])
+    pred = 1 if proba >= 0.5 else 0
+    return pred, proba
 
 
 # Endpoints
 @app.get("/", response_model=HealthOutput)
 def home():
     """Endpoint racine - vérification du statut."""
-    return {"status": "ok"}
+    return {"status": "ok", "model": "LSTM + FastText (TFLite)"}
 
 
 @app.get("/health", response_model=HealthOutput)
 def health():
     """Health check endpoint."""
-    return {"status": "ok"}
+    return {"status": "ok", "model": "LSTM + FastText (TFLite)"}
 
 
 @app.post("/predict", response_model=PredictionOutput)
@@ -84,21 +118,16 @@ def predict(data: TextInput):
         raise HTTPException(status_code=400, detail="Le texte ne peut pas être vide")
 
     try:
-        # Embeddings USE
-        embeddings = use_model([data.text]).numpy()
-
-        # Prédiction
-        pred = clf.predict(embeddings)[0]
-        proba = clf.predict_proba(embeddings)[0]
+        pred, proba = predict_single(data.text)
 
         return {
             "text": data.text,
             "sentiment": "Négatif" if pred == 0 else "Positif",
-            "prediction": int(pred),
-            "confidence": float(max(proba)),
+            "prediction": pred,
+            "confidence": proba if pred == 1 else 1 - proba,
             "probabilities": {
-                "negatif": float(proba[0]),
-                "positif": float(proba[1])
+                "negatif": 1 - proba,
+                "positif": proba
             }
         }
     except Exception as e:
@@ -116,20 +145,14 @@ def predict_batch(texts: list[str]):
         raise HTTPException(status_code=400, detail="La liste de textes ne peut pas être vide")
 
     try:
-        # Embeddings USE pour tous les textes
-        embeddings = use_model(texts).numpy()
-
-        # Prédictions
-        preds = clf.predict(embeddings)
-        probas = clf.predict_proba(embeddings)
-
         results = []
-        for i, text in enumerate(texts):
+        for text in texts:
+            pred, proba = predict_single(text)
             results.append({
                 "text": text,
-                "sentiment": "Négatif" if preds[i] == 0 else "Positif",
-                "prediction": int(preds[i]),
-                "confidence": float(max(probas[i]))
+                "sentiment": "Négatif" if pred == 0 else "Positif",
+                "prediction": pred,
+                "confidence": proba if pred == 1 else 1 - proba
             })
 
         return {"results": results, "count": len(results)}
