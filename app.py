@@ -1,6 +1,7 @@
 """
 API FastAPI pour l'analyse de sentiment - Air Paradis
 Modèle: LSTM Bidirectionnel + FastText (TensorFlow Lite)
+Monitoring: Azure Application Insights
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -8,12 +9,59 @@ import pickle
 import numpy as np
 import os
 import tensorflow as tf
+from opencensus.ext.azure.log_exporter import AzureLogHandler
+from opencensus.ext.azure import metrics_exporter
+from opencensus.stats import aggregation, measure, stats, view
+from opencensus.tags import tag_map as tag_map_module
+import logging
+from datetime import datetime
 
 # Configuration
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "model")
 MODEL_PATH = os.path.join(MODEL_DIR, "lstm_fasttext.tflite")
 TOKENIZER_PATH = os.path.join(MODEL_DIR, "tokenizer.pkl")
 CONFIG_PATH = os.path.join(MODEL_DIR, "config.pkl")
+
+# Azure Application Insights - Connection String
+APPINSIGHTS_CONNECTION_STRING = os.environ.get(
+    "APPINSIGHTS_CONNECTION_STRING",
+    "InstrumentationKey=7b290f98-0a3e-40d4-a2d2-a87fb1e1ec10;IngestionEndpoint=https://westeurope-5.in.applicationinsights.azure.com/;LiveEndpoint=https://westeurope.livediagnostics.monitor.azure.com/;ApplicationId=e1002b33-1463-448d-9fac-535ea6c60b8d"
+)
+
+# Configuration du logger pour Application Insights
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Ajouter Azure Log Handler si la clé est configurée
+if "YOUR_INSTRUMENTATION_KEY" not in APPINSIGHTS_CONNECTION_STRING:
+    azure_handler = AzureLogHandler(connection_string=APPINSIGHTS_CONNECTION_STRING)
+    logger.addHandler(azure_handler)
+
+    # Configuration des métriques
+    exporter = metrics_exporter.new_metrics_exporter(
+        connection_string=APPINSIGHTS_CONNECTION_STRING
+    )
+
+    # Mesure pour les feedbacks négatifs
+    bad_prediction_measure = measure.MeasureInt(
+        "bad_predictions",
+        "Nombre de prédictions signalées comme incorrectes",
+        "predictions"
+    )
+
+    bad_prediction_view = view.View(
+        "bad_predictions_count",
+        "Compteur de mauvaises prédictions",
+        [],
+        bad_prediction_measure,
+        aggregation.CountAggregation()
+    )
+
+    stats.stats.view_manager.register_view(bad_prediction_view)
+    stats.stats.view_manager.register_exporter(exporter)
+
+    mmap = stats.stats.stats_recorder.new_measurement_map()
+    tmap = tag_map_module.TagMap()
 
 # Initialisation de l'application
 app = FastAPI(
@@ -67,6 +115,26 @@ class HealthOutput(BaseModel):
     model: str
 
 
+class FeedbackInput(BaseModel):
+    text: str
+    predicted_sentiment: int
+    correct_sentiment: int
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "text": "The flight was okay I guess",
+                "predicted_sentiment": 0,
+                "correct_sentiment": 1
+            }
+        }
+
+
+class FeedbackOutput(BaseModel):
+    status: str
+    message: str
+
+
 def preprocess_text(texts: list[str]) -> np.ndarray:
     """Prétraite les textes pour le modèle LSTM."""
     sequences = tokenizer.texts_to_sequences(texts)
@@ -86,6 +154,27 @@ def predict_single(text: str) -> tuple[int, float]:
     proba = float(interpreter.get_tensor(output_details[0]['index'])[0][0])
     pred = 1 if proba >= 0.5 else 0
     return pred, proba
+
+
+def log_bad_prediction(text: str, predicted: int, correct: int):
+    """Enregistre une mauvaise prédiction dans Application Insights."""
+    custom_dimensions = {
+        "tweet_text": text[:500],  # Limiter la taille
+        "predicted_sentiment": "positif" if predicted == 1 else "negatif",
+        "correct_sentiment": "positif" if correct == 1 else "negatif",
+        "timestamp": datetime.utcnow().isoformat(),
+        "event_type": "bad_prediction"
+    }
+
+    logger.warning(
+        "Mauvaise prédiction signalée",
+        extra={"custom_dimensions": custom_dimensions}
+    )
+
+    # Incrémenter le compteur de métriques
+    if "YOUR_INSTRUMENTATION_KEY" not in APPINSIGHTS_CONNECTION_STRING:
+        mmap.measure_int_put(bad_prediction_measure, 1)
+        mmap.record(tmap)
 
 
 # Endpoints
@@ -120,6 +209,18 @@ def predict(data: TextInput):
     try:
         pred, proba = predict_single(data.text)
 
+        # Log de la prédiction pour le monitoring
+        logger.info(
+            "Prédiction effectuée",
+            extra={
+                "custom_dimensions": {
+                    "prediction": pred,
+                    "confidence": proba,
+                    "text_length": len(data.text)
+                }
+            }
+        )
+
         return {
             "text": data.text,
             "sentiment": "Négatif" if pred == 0 else "Positif",
@@ -131,30 +232,28 @@ def predict(data: TextInput):
             }
         }
     except Exception as e:
+        logger.error(f"Erreur de prédiction: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erreur de prédiction: {str(e)}")
 
 
-@app.post("/predict/batch")
-def predict_batch(texts: list[str]):
+@app.post("/feedback", response_model=FeedbackOutput)
+def feedback(data: FeedbackInput):
     """
-    Prédit le sentiment de plusieurs textes en une seule requête.
+    Enregistre un feedback utilisateur pour une prédiction incorrecte.
 
-    - **texts**: Liste de textes à analyser
+    Envoie les données à Azure Application Insights pour le monitoring.
     """
-    if not texts:
-        raise HTTPException(status_code=400, detail="La liste de textes ne peut pas être vide")
-
     try:
-        results = []
-        for text in texts:
-            pred, proba = predict_single(text)
-            results.append({
-                "text": text,
-                "sentiment": "Négatif" if pred == 0 else "Positif",
-                "prediction": pred,
-                "confidence": proba if pred == 1 else 1 - proba
-            })
+        log_bad_prediction(
+            text=data.text,
+            predicted=data.predicted_sentiment,
+            correct=data.correct_sentiment
+        )
 
-        return {"results": results, "count": len(results)}
+        return {
+            "status": "success",
+            "message": "Feedback enregistré dans Application Insights"
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur de prédiction: {str(e)}")
+        logger.error(f"Erreur feedback: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
